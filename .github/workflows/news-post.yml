@@ -5,10 +5,14 @@ on:
     - cron: '0 * * * *'
   workflow_dispatch:
 
+env:
+  HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
 jobs:
   post-news:
     runs-on: ubuntu-latest
-    
     steps:
       - uses: actions/checkout@v3
       
@@ -17,15 +21,9 @@ jobs:
           python-version: '3.11'
       
       - name: Install dependencies
-        run: |
-          pip install requests feedparser openai
+        run: pip install requests feedparser
       
       - name: Run Lenta bot
-        env:
-  HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
-  TG_TOKEN: ${{ secrets.TG_TOKEN }}
-  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-
         run: python src/main.py
       
       - name: Commit database
@@ -33,5 +31,5 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add data/sent_links.db || true
-          git commit -m "📊 Update sent news DB [skip ci]" || true
+          git commit -m "Update sent news DB [skip ci]" || true
           git push || true
