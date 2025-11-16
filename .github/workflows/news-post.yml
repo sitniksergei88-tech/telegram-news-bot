@@ -22,9 +22,10 @@ jobs:
       
       - name: Run Lenta bot
         env:
-          PERPLEXITY_KEY: ${{ secrets.PERPLEXITY_KEY }}
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+  HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
         run: python src/main.py
       
       - name: Commit database
