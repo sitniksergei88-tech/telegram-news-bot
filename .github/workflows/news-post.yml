@@ -1,8 +1,8 @@
-name: Post News to Telegram
+name: Post Lenta News to Telegram
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -20,10 +20,8 @@ jobs:
         run: |
           pip install requests feedparser openai
       
-      - name: Run news bot
+      - name: Run Lenta bot
         env:
-          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
-          GNEWS_KEY: ${{ secrets.GNEWS_KEY }}
           PERPLEXITY_KEY: ${{ secrets.PERPLEXITY_KEY }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -34,5 +32,5 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add data/sent_links.db || true
-          git commit -m "📊 Update DB [skip ci]" || true
+          git commit -m "📊 Update sent news DB [skip ci]" || true
           git push || true
