@@ -8,9 +8,9 @@ import time
 import os
 import sqlite3
 import re
-import json
 
 # ============= КОНФИГ =============
+HF_TOKEN = os.getenv("HF_API_TOKEN")  # Бесплатный HuggingFace API
 TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
@@ -20,7 +20,51 @@ MAX_TOP_ARTICLES = 5
 INTERVAL_BETWEEN_POSTS = 300
 DB = "data/sent_links.db"
 
-# ============= LOGGING =============
+# ============= HUGGINGFACE INFERENCE API (БЕСПЛАТНЫЙ!) =============
+
+def call_hf_model(prompt):
+    """
+    HuggingFace Inference API - БЕСПЛАТНЫЙ!
+    https://huggingface.co/settings/tokens
+    
+    ✅ 250,000 символов текста БЕСПЛАТНО в месяц
+    ✅ Работает из России
+    ✅ Готовые открытые модели (Mistral, Llama2)
+    ✅ На GitHub Actions работает
+    """
+    try:
+        # Используем Mistral-7B (хорошее соотношение качество/скорость)
+        response = requests.post(
+            "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1",
+            headers={"Authorization": f"Bearer {HF_TOKEN}"},
+            json={
+                "inputs": prompt,
+                "parameters": {
+                    "max_new_tokens": 150,
+                    "temperature": 0.7,
+                    "do_sample": True
+                }
+            },
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, list) and len(data) > 0:
+                result = data[0].get("generated_text", "").strip()
+                # Удаляем исходный промпт из результата
+                if prompt in result:
+                    result = result.replace(prompt, "").strip()
+                result = re.sub(r'\d+$', '', result).strip()
+                return result[:200]
+        else:
+            safe_log(f"  ⚠️ HF ошибка {response.status_code}")
+            return None
+    except Exception as e:
+        safe_log(f"  ✗ HF: {e}")
+        return None
+
+# ============= ЛОГИРОВАНИЕ =============
 
 def safe_log(msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -40,12 +84,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS sent (
             url TEXT PRIMARY KEY,
             title TEXT,
+            summary TEXT,
             time TIMESTAMP
         )
     """)
     conn.commit()
     conn.close()
-    safe_log("✓ База данных инициализирована")
+    safe_log("✓ База данных готова")
 
 def was_sent(url):
     conn = sqlite3.connect(DB)
@@ -53,10 +98,10 @@ def was_sent(url):
     conn.close()
     return result is not None
 
-def mark_sent(url, title):
+def mark_sent(url, title, summary):
     conn = sqlite3.connect(DB)
-    conn.execute("INSERT OR IGNORE INTO sent VALUES (?, ?, ?)", 
-                 (url, title, datetime.now()))
+    conn.execute("INSERT OR IGNORE INTO sent VALUES (?, ?, ?, ?)", 
+                 (url, title, summary, datetime.now()))
     conn.commit()
     conn.close()
 
@@ -69,7 +114,7 @@ def get_sent_count():
 # ============= СБОР НОВОСТЕЙ =============
 
 def fetch_all_lenta_rss():
-    safe_log(f"📰 Загрузка ВСЕ новости из RSS: {RSS_URL}")
+    safe_log(f"📰 Lenta.ru RSS...")
     
     try:
         feed = feedparser.parse(RSS_URL)
@@ -78,9 +123,8 @@ def fetch_all_lenta_rss():
         for entry in feed.entries[:100]:
             title = entry.get("title", "").strip()
             link = entry.get("link", "").strip()
-            summary = entry.get("summary", "")[:300].strip()
+            summary = entry.get("summary", "")[:400].strip()
             
-            # Очищаем от цифр
             title = re.sub(r'\d+$', '', title).strip()
             summary = re.sub(r'\d+$', '', summary).strip()
             
@@ -90,7 +134,7 @@ def fetch_all_lenta_rss():
             elif hasattr(entry, 'enclosures') and entry.enclosures:
                 image = entry.enclosures[0].get('href')
             
-            if not title or not link:
+            if not title or not link or len(summary) < 20:
                 continue
             
             if was_sent(link):
@@ -104,126 +148,124 @@ def fetch_all_lenta_rss():
                 "source": "Lenta.ru"
             })
         
-        safe_log(f"✓ Найдено НОВЫХ новостей: {len(articles)}")
+        safe_log(f"✓ Найдено: {len(articles)}")
         return articles
         
     except Exception as e:
-        safe_log(f"✗ Ошибка загрузки RSS: {e}")
+        safe_log(f"✗ Ошибка: {e}")
         return []
 
-# ============= БЫСТРАЯ ОЦЕНКА (БЕЗ AI!) =============
+# ============= ОЦЕНКА + ПЕРЕПИСАНИЕ =============
 
-def quick_rank_articles(articles):
+def rank_and_rewrite(articles):
     """
-    Оценивает новости БЕЗ AI - только по ключевым словам!
-    100% БЕСПЛАТНО!
+    Оценивает + переписывает текст с помощью открытой модели
     """
     if not articles:
         return []
     
-    safe_log(f"🚀 Быстрая оценка {len(articles)} новостей (БЕЗ API)...\n")
+    safe_log(f"🤖 HuggingFace (Mistral): оценка + переписание {len(articles)}...\n")
     
-    # Ключевые слова для определения важности
-    critical_words = ['взрыв', 'крах', 'терор', 'война', 'чп', 'катастроф', 'авария', 'смерт', 'убит', 
-                      'убийство', 'теракт', 'армия', 'войска', 'бомб', 'удар', 'атак', 'конфликт',
-                      'восстани', 'переворот', 'санкци', 'отставк', 'арест', 'скандал']
+    rated_articles = []
     
-    important_words = ['курс', 'доллар', 'евро', 'криптовалют', 'акци', 'биржа', 'инвестиц',
-                       'экономик', 'производ', 'компани', 'корпораци', 'работ', 'безработ',
-                       'правител', 'президент', 'министр', 'закон', 'суд', 'технолог',
-                       'ai', 'искусствен', 'интернет', 'киберат', 'хакер']
-    
-    interesting_words = ['кино', 'фильм', 'актер', 'актриса', 'мьюзик', 'певец', 'певиц',
-                         'спорт', 'футбол', 'хоккей', 'теннис', 'олимпи', 'чемпион',
-                         'конкурс', 'мода', 'красот', 'здоровье', 'медицин', 'наук']
-    
-    for article in articles:
-        title = article.get("title", "").lower()
-        desc = article.get("description", "").lower()
-        text = title + " " + desc
+    for i, article in enumerate(articles, 1):
+        title = article.get("title", "")
+        desc = article.get("description", "")
         
-        # Подсчитываем совпадения
-        critical_count = sum(1 for word in critical_words if word in text)
-        important_count = sum(1 for word in important_words if word in text)
-        interesting_count = sum(1 for word in interesting_words if word in text)
+        # Более простой промпт для открытой модели
+        prompt = f"""Оцени новость от 1 до 10 и переписи в 2 предложениях.
+
+Заголовок: {title}
+Текст: {desc}
+
+Ответ:
+Оценка: [число]
+Текст: [2 предложения]"""
         
-        # Вычисляем рейтинг
-        if critical_count > 0:
-            rating = 8 + critical_count  # 8-10+
-        elif important_count > 0:
-            rating = 6 + min(important_count, 2)  # 6-8
-        elif interesting_count > 0:
-            rating = 5  # 5
-        else:
-            rating = 3  # 3
+        try:
+            response_text = call_hf_model(prompt)
+            
+            if not response_text:
+                safe_log(f"  [{i}] ⚠️ Модель не ответила")
+                continue
+            
+            # Парсим ответ
+            rating = 5
+            new_summary = desc[:200]
+            
+            # Ищем оценку
+            lines = response_text.split('\n')
+            for line in lines:
+                if 'оценка' in line.lower() or 'Оценка' in line:
+                    try:
+                        rating = int(''.join(filter(str.isdigit, line[:20])) or 5)
+                        rating = min(max(rating, 1), 10)
+                    except:
+                        pass
+                if 'текст' in line.lower() or 'Текст' in line:
+                    idx = lines.index(line)
+                    new_summary = '\n'.join(lines[idx:])
+                    new_summary = new_summary.replace('текст:', '').replace('Текст:', '').strip()
+            
+            # Если парсинг не сработал - берём весь результат
+            if not new_summary or len(new_summary) < 10:
+                new_summary = response_text
+            
+            new_summary = new_summary[:200].strip()
+            
+            # Убираем цифры в конце
+            new_summary = re.sub(r'\d+$', '', new_summary).strip()
+            
+            if new_summary and len(new_summary) > 10:
+                article["summary"] = new_summary
+                article["rating"] = rating
+                rated_articles.append(article)
+                
+                safe_log(f"  [{i}] ⭐{rating}/10 - {title[:35]}...")
+            else:
+                safe_log(f"  [{i}] ⚠️ Плохой результат")
+            
+        except Exception as e:
+            safe_log(f"  [{i}] ✗ Ошибка: {e}")
+            continue
         
-        # Ограничиваем от 1 до 10
-        rating = min(max(rating, 1), 10)
-        
-        article["rating"] = rating
-        safe_log(f"  ⭐{rating}/10 - {article['title'][:50]}...")
+        time.sleep(1)  # Щадим API
     
-    # Сортируем по рейтингу
-    articles.sort(key=lambda x: x.get("rating", 0), reverse=True)
+    # Сортируем
+    if not rated_articles:
+        safe_log("⚠️ Нет обработанных новостей")
+        return []
     
-    # Берём только топ-5
-    top_articles = articles[:MAX_TOP_ARTICLES]
+    safe_log(f"\n📊 Сортировка...")
+    rated_articles.sort(key=lambda x: x.get("rating", 0), reverse=True)
     
-    safe_log(f"\n✓ Выбраны ТОП-{len(top_articles)} по важности:")
+    top_articles = rated_articles[:MAX_TOP_ARTICLES]
+    
+    safe_log(f"✓ ТОП-{len(top_articles)}:")
     for idx, art in enumerate(top_articles, 1):
-        safe_log(f"   {idx}. ⭐{art['rating']}/10 - {art['title'][:50]}...")
+        safe_log(f"   {idx}. ⭐{art['rating']}/10 - {art['title'][:35]}...")
     
     return top_articles
-
-# ============= УЛУЧШАЕМ ТЕКСТ =============
-
-def improve_summary(article):
-    """Берём первые 2 предложения из описания - вот и суммаризация!"""
-    desc = article.get("description", "")
-    
-    # Берём первое предложение
-    sentences = desc.split('.')
-    summary = sentences[0].strip() + "."
-    
-    if len(sentences) > 1:
-        summary += " " + sentences[1].strip() + "."
-    
-    # Добавляем эмодзи в зависимости от рейтинга
-    rating = article.get("rating", 5)
-    if rating >= 8:
-        emoji = "🔴"  # Критично
-    elif rating >= 6:
-        emoji = "🟠"  # Важно
-    else:
-        emoji = "🔵"  # Интересно
-    
-    summary = emoji + " " + summary[:200]
-    summary = re.sub(r'\d+$', '', summary).strip()
-    
-    return summary
 
 # ============= ОТПРАВКА В TELEGRAM =============
 
 def send_to_telegram(articles):
     if not articles:
-        safe_log("⚠️ ❌ НЕТ ДОСТАТОЧНО ХОРОШИХ НОВОСТЕЙ - НИЧЕГО НЕ ПОСТИМ")
+        safe_log("⚠️ НЕТ НОВОСТЕЙ")
         return 0, 0
     
-    log_section(f"📤 ОТПРАВКА {len(articles)} ТОПОВЫХ НОВОСТЕЙ")
+    log_section(f"📤 ОТПРАВКА {len(articles)}")
     
     sent = 0
     failed = 0
     
     for i, article in enumerate(articles, 1):
         title = article.get("title", "")
+        summary = article.get("summary", "")
         url = article.get("url", "")
         image = article.get("image", "")
         rating = article.get("rating", 0)
         
-        # Улучшаем описание
-        summary = improve_summary(article)
-        
-        # Формируем сообщение
         stars = "⭐" * (rating // 2)
         message = f"""*{title}*
 
@@ -256,19 +298,19 @@ def send_to_telegram(articles):
                 )
             
             if response.status_code == 200:
-                safe_log(f"[{i}/{len(articles)}] ✓ Отправлено: {title[:45]}...")
-                mark_sent(url, title)
+                safe_log(f"[{i}] ✓ {title[:35]}...")
+                mark_sent(url, title, summary)
                 sent += 1
             else:
-                safe_log(f"[{i}/{len(articles)}] ✗ HTTP {response.status_code}")
+                safe_log(f"[{i}] ✗ HTTP {response.status_code}")
                 failed += 1
         
         except Exception as e:
-            safe_log(f"[{i}/{len(articles)}] ✗ Ошибка: {e}")
+            safe_log(f"[{i}] ✗ {e}")
             failed += 1
         
         if i < len(articles):
-            safe_log(f"⏳ Ожидание 5 минут...")
+            safe_log(f"⏳ 5 минут...")
             time.sleep(INTERVAL_BETWEEN_POSTS)
     
     return sent, failed
@@ -276,47 +318,51 @@ def send_to_telegram(articles):
 # ============= ГЛАВНАЯ =============
 
 def main():
-    log_section("🚀 LENTA.RU TOP-5 → TELEGRAM (100% БЕСПЛАТНО!)")
+    log_section("🚀 LENTA.RU TOP-5 → TELEGRAM (HuggingFace - OPEN SOURCE!)")
     
-    if not all([TG_TOKEN, TG_CHAT_ID]):
-        safe_log("❌ ОШИБКА: TG_TOKEN или TG_CHAT_ID не установлены!")
+    if not all([HF_TOKEN, TG_TOKEN, TG_CHAT_ID]):
+        safe_log("❌ ОШИБКА: нужны ключи!")
+        safe_log("   HF_API_TOKEN (https://huggingface.co/settings/tokens)")
+        safe_log("   TG_TOKEN")
+        safe_log("   TG_CHAT_ID")
         return
     
-    safe_log("✓ Telegram ключи загружены")
-    safe_log(f"⚙️ Режим: БЕСПЛАТНЫЙ (без AI API!)")
-    safe_log(f"💰 ЦЕНА: $0 в месяц!")
+    safe_log("✓ Ключи готовы")
+    safe_log(f"💰 HuggingFace: БЕСПЛАТНО (250k символов/месяц)")
+    safe_log(f"🔓 Модель: Mistral-7B (открытая!)")
     
     init_db()
     
     total_sent = get_sent_count()
-    safe_log(f"📊 Всего отправлено: {total_sent} новостей")
+    safe_log(f"📊 Всего: {total_sent}")
     
-    log_section("ЭТАП 1: СБОР ВСЕ НОВЫЕ НОВОСТИ")
+    log_section("ЭТАП 1: СБОР")
     articles = fetch_all_lenta_rss()
     
     if not articles:
-        safe_log("ℹ️ НОВЫХ НОВОСТЕЙ НЕТ (все уже отправлены)")
+        safe_log("ℹ️ НОВОСТЕЙ НЕТ")
         return
     
-    log_section("ЭТАП 2: БЫСТРАЯ ОЦЕНКА (БЕЗ AI)")
-    top_articles = quick_rank_articles(articles)
+    log_section("ЭТАП 2: ОЦЕНКА + ПЕРЕПИСАНИЕ (Open Source)")
+    top_articles = rank_and_rewrite(articles)
+    
+    if not top_articles:
+        safe_log("⚠️ Не удалось обработать новости")
+        return
     
     log_section("ЭТАП 3: ОТПРАВКА")
     sent, failed = send_to_telegram(top_articles)
     
     log_section("✨ ГОТОВО")
-    safe_log(f"✅ Успешно отправлено: {sent} топовых новостей")
-    if failed > 0:
-        safe_log(f"❌ Ошибок: {failed}")
-    
+    safe_log(f"✅ Отправлено: {sent}")
     new_total = get_sent_count()
-    safe_log(f"📊 Всего в базе: {new_total} новостей")
-    safe_log(f"\n💰 ЗАТРАТЫ: $0.00 (БЕЗ API!)")
+    safe_log(f"📊 Всего: {new_total}")
+    safe_log(f"\n💰 СТОИМОСТЬ: БЕСПЛАТНО (Open Source!)")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        safe_log(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        safe_log(f"❌ ОШИБКА: {e}")
         import traceback
         traceback.print_exc()
