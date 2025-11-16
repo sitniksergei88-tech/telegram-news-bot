@@ -4,31 +4,23 @@
 import requests
 import feedparser
 from datetime import datetime
-from openai import OpenAI
 import time
 import os
 import sqlite3
+import re
+import json
 
 # ============= КОНФИГ =============
-PERPLEXITY_KEY = os.getenv("PERPLEXITY_KEY")
 TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
 # НАСТРОЙКИ
 RSS_URL = "https://lenta.ru/rss"
-MAX_TOP_ARTICLES = 5  # МАКСИМУМ 5 топовых в час
-INTERVAL_BETWEEN_POSTS = 300  # 5 минут между постами
+MAX_TOP_ARTICLES = 5
+INTERVAL_BETWEEN_POSTS = 300
 DB = "data/sent_links.db"
 
-# ============= PERPLEXITY =============
-
-def create_perplexity_client():
-    return OpenAI(
-        api_key=PERPLEXITY_KEY,
-        base_url="https://api.perplexity.ai"
-    )
-
-# ============= ЛОГИРОВАНИЕ =============
+# ============= LOGGING =============
 
 def safe_log(msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -39,7 +31,7 @@ def log_section(title):
     print(f"  {title}")
     print(f"{'='*70}\n")
 
-# ============= БД (ДЕДУПЛИКАЦИЯ) =============
+# ============= БД =============
 
 def init_db():
     os.makedirs("data", exist_ok=True)
@@ -56,14 +48,12 @@ def init_db():
     safe_log("✓ База данных инициализирована")
 
 def was_sent(url):
-    """Проверяет, отправлялась ли новость раньше"""
     conn = sqlite3.connect(DB)
     result = conn.execute("SELECT 1 FROM sent WHERE url=?", (url,)).fetchone()
     conn.close()
     return result is not None
 
 def mark_sent(url, title):
-    """Сохраняет новость как отправленную"""
     conn = sqlite3.connect(DB)
     conn.execute("INSERT OR IGNORE INTO sent VALUES (?, ?, ?)", 
                  (url, title, datetime.now()))
@@ -71,31 +61,29 @@ def mark_sent(url, title):
     conn.close()
 
 def get_sent_count():
-    """Возвращает количество отправленных новостей"""
     conn = sqlite3.connect(DB)
     result = conn.execute("SELECT COUNT(*) FROM sent").fetchone()
     conn.close()
     return result[0] if result else 0
 
-# ============= СБОР ВСЕ НОВОСТЕЙ ИЗ LENTA.RU =============
+# ============= СБОР НОВОСТЕЙ =============
 
 def fetch_all_lenta_rss():
-    """
-    Собирает ВСЕ новые новости из Lenta.ru (за час)
-    Пропускает только уже отправленные
-    """
     safe_log(f"📰 Загрузка ВСЕ новости из RSS: {RSS_URL}")
     
     try:
         feed = feedparser.parse(RSS_URL)
         articles = []
         
-        for entry in feed.entries[:100]:  # Ищем в 100 последних
+        for entry in feed.entries[:100]:
             title = entry.get("title", "").strip()
             link = entry.get("link", "").strip()
             summary = entry.get("summary", "")[:300].strip()
             
-            # Извлекаем фото из RSS
+            # Очищаем от цифр
+            title = re.sub(r'\d+$', '', title).strip()
+            summary = re.sub(r'\d+$', '', summary).strip()
+            
             image = None
             if hasattr(entry, 'media_content') and entry.media_content:
                 image = entry.media_content[0].get('url')
@@ -105,7 +93,6 @@ def fetch_all_lenta_rss():
             if not title or not link:
                 continue
             
-            # ВАЖНО: Пропускаем ЕСЛИ УЖЕ ОТПРАВЛЯЛИ
             if was_sent(link):
                 continue
             
@@ -124,101 +111,100 @@ def fetch_all_lenta_rss():
         safe_log(f"✗ Ошибка загрузки RSS: {e}")
         return []
 
-# ============= AI ОЦЕНКА КАЧЕСТВА И РАНЖИРОВАНИЕ =============
+# ============= БЫСТРАЯ ОЦЕНКА (БЕЗ AI!) =============
 
-def rank_and_summarize_with_perplexity(articles):
+def quick_rank_articles(articles):
     """
-    1. Оценивает КАЧЕСТВО каждой новости (1-10)
-    2. Сортирует по качеству (топовые первыми)
-    3. Берёт только ТОП-5 лучших
-    4. Суммаризирует их
+    Оценивает новости БЕЗ AI - только по ключевым словам!
+    100% БЕСПЛАТНО!
     """
     if not articles:
         return []
     
-    safe_log(f"🤖 Perplexity: ранжирование + суммаризация {len(articles)} новостей...\n")
+    safe_log(f"🚀 Быстрая оценка {len(articles)} новостей (БЕЗ API)...\n")
     
-    client = create_perplexity_client()
-    rated_articles = []
+    # Ключевые слова для определения важности
+    critical_words = ['взрыв', 'крах', 'терор', 'война', 'чп', 'катастроф', 'авария', 'смерт', 'убит', 
+                      'убийство', 'теракт', 'армия', 'войска', 'бомб', 'удар', 'атак', 'конфликт',
+                      'восстани', 'переворот', 'санкци', 'отставк', 'арест', 'скандал']
     
-    for i, article in enumerate(articles, 1):
-        title = article.get("title", "")
-        desc = article.get("description", "")
+    important_words = ['курс', 'доллар', 'евро', 'криптовалют', 'акци', 'биржа', 'инвестиц',
+                       'экономик', 'производ', 'компани', 'корпораци', 'работ', 'безработ',
+                       'правител', 'президент', 'министр', 'закон', 'суд', 'технолог',
+                       'ai', 'искусствен', 'интернет', 'киберат', 'хакер']
+    
+    interesting_words = ['кино', 'фильм', 'актер', 'актриса', 'мьюзик', 'певец', 'певиц',
+                         'спорт', 'футбол', 'хоккей', 'теннис', 'олимпи', 'чемпион',
+                         'конкурс', 'мода', 'красот', 'здоровье', 'медицин', 'наук']
+    
+    for article in articles:
+        title = article.get("title", "").lower()
+        desc = article.get("description", "").lower()
+        text = title + " " + desc
         
-        # ЭТАП 1: Оцениваем ВАЖНОСТЬ/КАЧЕСТВО новости
-        rating_prompt = f"""Оцени ВАЖНОСТЬ этой новости (от 1 до 10):
-
-Заголовок: {title}
-Текст: {desc}
-
-Критерии:
-- 9-10: ОЧЕНЬ ВАЖНАЯ (критические события, ЧП, политика)
-- 7-8: ВАЖНАЯ (значимые события, бизнес, технологии)
-- 5-6: ИНТЕРЕСНАЯ (культура, общество, спорт)
-- 1-4: МАЛОВАЖНАЯ (развлечение, мелочи)
-
-ОТВЕТЬ ТОЛЬКО ЧИСЛОМ (1-10)!"""
+        # Подсчитываем совпадения
+        critical_count = sum(1 for word in critical_words if word in text)
+        important_count = sum(1 for word in important_words if word in text)
+        interesting_count = sum(1 for word in interesting_words if word in text)
         
-        try:
-            rating_response = client.chat.completions.create(
-                model="sonar",
-                messages=[{"role": "user", "content": rating_prompt}],
-                max_tokens=5,
-                temperature=0.3
-            )
-            
-            rating_text = rating_response.choices[0].message.content.strip()
-            rating = int(''.join(filter(str.isdigit, rating_text)) or 0)
-            
-            safe_log(f"  [{i}] Оценка: {rating}/10 - {title[:50]}...")
-            
-            # ЭТАП 2: Суммаризируем
-            summary_prompt = f"""Напиши краткую, интересную сводку для Telegram (2-3 предложения):
-
-Заголовок: {title}
-Текст: {desc}
-
-Требования:
-- 2-3 предложения (не больше!)
-- Добавь 1-2 эмодзи
-- Сделай интересным
-- Не повторяй заголовок"""
-            
-            summary_response = client.chat.completions.create(
-                model="sonar",
-                messages=[{"role": "user", "content": summary_prompt}],
-                max_tokens=150,
-                temperature=0.7
-            )
-            
-            article["summary"] = summary_response.choices[0].message.content.strip()
-            article["rating"] = rating
-            rated_articles.append(article)
-            safe_log(f"      ✓ ОЦЕНЕНА")
-            
-        except Exception as e:
-            safe_log(f"  [{i}] ✗ Ошибка: {e}")
-            continue
+        # Вычисляем рейтинг
+        if critical_count > 0:
+            rating = 8 + critical_count  # 8-10+
+        elif important_count > 0:
+            rating = 6 + min(important_count, 2)  # 6-8
+        elif interesting_count > 0:
+            rating = 5  # 5
+        else:
+            rating = 3  # 3
         
-        time.sleep(0.3)
+        # Ограничиваем от 1 до 10
+        rating = min(max(rating, 1), 10)
+        
+        article["rating"] = rating
+        safe_log(f"  ⭐{rating}/10 - {article['title'][:50]}...")
     
-    # СОРТИРУЕМ ПО РЕЙТИНГУ (больше = лучше)
-    safe_log(f"\n📊 Сортировка по качеству...")
-    rated_articles.sort(key=lambda x: x.get("rating", 0), reverse=True)
+    # Сортируем по рейтингу
+    articles.sort(key=lambda x: x.get("rating", 0), reverse=True)
     
-    # БЕРЁМ ТОЛЬКО ТОП-5
-    top_articles = rated_articles[:MAX_TOP_ARTICLES]
+    # Берём только топ-5
+    top_articles = articles[:MAX_TOP_ARTICLES]
     
-    safe_log(f"✓ Выбраны ТОП-{len(top_articles)} лучших новостей:")
+    safe_log(f"\n✓ Выбраны ТОП-{len(top_articles)} по важности:")
     for idx, art in enumerate(top_articles, 1):
         safe_log(f"   {idx}. ⭐{art['rating']}/10 - {art['title'][:50]}...")
     
     return top_articles
 
+# ============= УЛУЧШАЕМ ТЕКСТ =============
+
+def improve_summary(article):
+    """Берём первые 2 предложения из описания - вот и суммаризация!"""
+    desc = article.get("description", "")
+    
+    # Берём первое предложение
+    sentences = desc.split('.')
+    summary = sentences[0].strip() + "."
+    
+    if len(sentences) > 1:
+        summary += " " + sentences[1].strip() + "."
+    
+    # Добавляем эмодзи в зависимости от рейтинга
+    rating = article.get("rating", 5)
+    if rating >= 8:
+        emoji = "🔴"  # Критично
+    elif rating >= 6:
+        emoji = "🟠"  # Важно
+    else:
+        emoji = "🔵"  # Интересно
+    
+    summary = emoji + " " + summary[:200]
+    summary = re.sub(r'\d+$', '', summary).strip()
+    
+    return summary
+
 # ============= ОТПРАВКА В TELEGRAM =============
 
 def send_to_telegram(articles):
-    """Отправляет ТОП новости в Telegram с интервалом 5 минут"""
     if not articles:
         safe_log("⚠️ ❌ НЕТ ДОСТАТОЧНО ХОРОШИХ НОВОСТЕЙ - НИЧЕГО НЕ ПОСТИМ")
         return 0, 0
@@ -230,13 +216,15 @@ def send_to_telegram(articles):
     
     for i, article in enumerate(articles, 1):
         title = article.get("title", "")
-        summary = article.get("summary", "")
         url = article.get("url", "")
         image = article.get("image", "")
         rating = article.get("rating", 0)
         
-        # Формируем сообщение с рейтингом (звёзды)
-        stars = "⭐" * (rating // 2)  # Переводим в звёзды: 10→5⭐, 8→4⭐
+        # Улучшаем описание
+        summary = improve_summary(article)
+        
+        # Формируем сообщение
+        stars = "⭐" * (rating // 2)
         message = f"""*{title}*
 
 {summary}
@@ -244,7 +232,6 @@ def send_to_telegram(articles):
 {stars}"""
         
         try:
-            # Если есть фото → отправляем с фото
             if image:
                 response = requests.post(
                     f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
@@ -257,7 +244,6 @@ def send_to_telegram(articles):
                     timeout=10
                 )
             else:
-                # Если нет фото → отправляем текст
                 response = requests.post(
                     f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                     json={
@@ -281,7 +267,6 @@ def send_to_telegram(articles):
             safe_log(f"[{i}/{len(articles)}] ✗ Ошибка: {e}")
             failed += 1
         
-        # Ждем 5 минут перед следующим постом (кроме последнего)
         if i < len(articles):
             safe_log(f"⏳ Ожидание 5 минут...")
             time.sleep(INTERVAL_BETWEEN_POSTS)
@@ -291,25 +276,21 @@ def send_to_telegram(articles):
 # ============= ГЛАВНАЯ =============
 
 def main():
-    log_section("🚀 LENTA.RU TOP-5 → TELEGRAM")
+    log_section("🚀 LENTA.RU TOP-5 → TELEGRAM (100% БЕСПЛАТНО!)")
     
-    # Проверяем ключи
-    if not all([PERPLEXITY_KEY, TG_TOKEN, TG_CHAT_ID]):
-        safe_log("❌ ОШИБКА: Не все ключи установлены!")
+    if not all([TG_TOKEN, TG_CHAT_ID]):
+        safe_log("❌ ОШИБКА: TG_TOKEN или TG_CHAT_ID не установлены!")
         return
     
-    safe_log("✓ Все ключи загружены")
-    safe_log(f"⚙️ Режим: ВСЕ новости за час → выбираем ТОП-{MAX_TOP_ARTICLES}")
-    safe_log(f"⚙️ Интервал: {INTERVAL_BETWEEN_POSTS//60} минут между постами")
+    safe_log("✓ Telegram ключи загружены")
+    safe_log(f"⚙️ Режим: БЕСПЛАТНЫЙ (без AI API!)")
+    safe_log(f"💰 ЦЕНА: $0 в месяц!")
     
-    # Инициализируем БД
     init_db()
     
-    # Статистика
     total_sent = get_sent_count()
     safe_log(f"📊 Всего отправлено: {total_sent} новостей")
     
-    # ЭТАП 1: Сбор ВСЕ новых новостей (за час)
     log_section("ЭТАП 1: СБОР ВСЕ НОВЫЕ НОВОСТИ")
     articles = fetch_all_lenta_rss()
     
@@ -317,15 +298,12 @@ def main():
         safe_log("ℹ️ НОВЫХ НОВОСТЕЙ НЕТ (все уже отправлены)")
         return
     
-    # ЭТАП 2: Ранжирование + выбор топ-5 + суммаризация
-    log_section("ЭТАП 2: РАНЖИРОВАНИЕ И ВЫБОР ТОП-5")
-    top_articles = rank_and_summarize_with_perplexity(articles)
+    log_section("ЭТАП 2: БЫСТРАЯ ОЦЕНКА (БЕЗ AI)")
+    top_articles = quick_rank_articles(articles)
     
-    # ЭТАП 3: Отправка (или нет, если плохих новостей)
     log_section("ЭТАП 3: ОТПРАВКА")
     sent, failed = send_to_telegram(top_articles)
     
-    # Финал
     log_section("✨ ГОТОВО")
     safe_log(f"✅ Успешно отправлено: {sent} топовых новостей")
     if failed > 0:
@@ -333,6 +311,7 @@ def main():
     
     new_total = get_sent_count()
     safe_log(f"📊 Всего в базе: {new_total} новостей")
+    safe_log(f"\n💰 ЗАТРАТЫ: $0.00 (БЕЗ API!)")
 
 if __name__ == "__main__":
     try:
