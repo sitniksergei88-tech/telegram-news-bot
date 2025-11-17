@@ -7,7 +7,6 @@ import time
 import os
 import sqlite3
 import re
-import json
 
 HF_TOKEN = os.getenv("HF_API_TOKEN")
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -54,27 +53,15 @@ def fetch_lenta():
         link = entry.get("link", "").strip()
         desc = entry.get("summary", "")[:400].strip()
         
-        # Очищаем от цифр в конце
         title = re.sub(r'\d+$', '', title).strip()
         desc = re.sub(r'\d+$', '', desc).strip()
         
-        # Ищем фото
         image_url = None
-        
-        # Способ 1: media_content
         if hasattr(entry, 'media_content') and entry.media_content:
             image_url = entry.media_content[0].get('url')
         
-        # Способ 2: enclosures
         if not image_url and hasattr(entry, 'enclosures') and entry.enclosures:
             image_url = entry.enclosures[0].get('href')
-        
-        # Способ 3: image tag в описании
-        if not image_url:
-            import re
-            img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', desc)
-            if img_match:
-                image_url = img_match.group(1)
         
         if not title or not link or len(desc) < 30:
             continue
@@ -97,12 +84,12 @@ def rewrite_with_hf(title, text):
     if not HF_TOKEN:
         return text[:150]
     
-    prompt = f"""Переписи это новое новостью в 2-3 предложениях. Не копируй исходный текст!
+    prompt = f"""Переписи это новость в 2-3 предложениях. Не копируй исходный текст!
 
 Заголовок: {title}
 Текст: {text}
 
-Ответ (ТОЛЬКО ПЕРЕПИСАННЫЙ ТЕКСТ, БЕЗ ПОЯСНЕНИЙ):"""
+Ответ (ТОЛЬКО ПЕРЕПИСАННЫЙ ТЕКСТ):"""
     
     try:
         response = requests.post(
@@ -123,24 +110,18 @@ def rewrite_with_hf(title, text):
             data = response.json()
             if isinstance(data, list) and len(data) > 0:
                 result = data[0].get("generated_text", "").strip()
-                
-                # Убираем исходный промпт
                 if prompt in result:
                     result = result.replace(prompt, "").strip()
-                
-                # Берём первые 2-3 предложения
-                sentences = result.split('.')[:3]
-                result = '.'.join(sentences).strip() + '.'
+                result = result.split('.')[0] + '.'
                 result = re.sub(r'\d+$', '', result).strip()
-                
-                return result[:200] if result else text[:150]
+                return result[:200] if len(result) > 10 else text[:150]
     except:
         pass
     
     return text[:150]
 
 def download_image(url):
-    """Загружает изображение и возвращает путь"""
+    """Загружает изображение"""
     if not url:
         return None
     
@@ -162,16 +143,13 @@ def send_to_telegram(articles):
         safe_log("⚠️ НЕТ НОВОСТЕЙ")
         return 0
     
-    safe_log(f"📤 Отправляю {len(articles)} новостей...\n")
+    safe_log(f"📤 Отправляю {len(articles)}...\n")
     sent = 0
     
     for i, art in enumerate(articles, 1):
         title = art["title"]
-        
-        # Переписываем текст
         summary = rewrite_with_hf(title, art["desc"])
         
-        # Загружаем фото
         image_path = None
         if art["image"]:
             image_path = download_image(art["image"])
@@ -180,7 +158,6 @@ def send_to_telegram(articles):
         
         try:
             if image_path and os.path.exists(image_path):
-                # Отправляем с фото
                 with open(image_path, 'rb') as photo:
                     files = {'photo': photo}
                     data = {
@@ -194,9 +171,11 @@ def send_to_telegram(articles):
                         data=data,
                         timeout=10
                     )
-                os.remove(image_path)  # Удаляем временный файл
+                try:
+                    os.remove(image_path)
+                except:
+                    pass
             else:
-                # Отправляем без фото
                 requests.post(
                     f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                     json={
@@ -211,31 +190,29 @@ def send_to_telegram(articles):
             mark_sent(art["url"], art["title"], summary)
             sent += 1
             
-            # Пауза между сообщениями
             if i < len(articles):
-                time.sleep(3)
+                time.sleep(2)
         
         except Exception as e:
-            safe_log(f"✗ [{i}] Ошибка: {e}")
+            safe_log(f"✗ [{i}] {str(e)[:50]}")
     
     return sent
 
 def main():
-    safe_log("🚀 LENTA → TELEGRAM (HF + PHOTOS)")
+    safe_log("🚀 LENTA → TELEGRAM")
     
     if not all([HF_TOKEN, TG_TOKEN, TG_CHAT_ID]):
-        safe_log("❌ ОШИБКА: нужны секреты!")
+        safe_log("❌ ОШИБКА: нет секретов!")
         return
     
     init_db()
     articles = fetch_lenta()
     
     if not articles:
-        safe_log("ℹ️ НОВОСТЕЙ НЕТ")
+        safe_log("ℹ️ НЕТ НОВОСТЕЙ")
         return
     
     sent = send_to_telegram(articles[:MAX_TOP_ARTICLES])
-    
     safe_log(f"\n✨ ГОТОВО! Отправлено: {sent}")
 
 if __name__ == "__main__":
