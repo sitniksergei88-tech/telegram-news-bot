@@ -2,7 +2,7 @@ name: Post Lenta News to Telegram
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '*/5 * * * *'  # Запускается каждые 5 минут
   workflow_dispatch:
 
 env:
@@ -15,21 +15,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
+
       - uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-      
+          python-version: '3.10'
+
       - name: Install dependencies
-        run: pip install requests feedparser
-      
+        run: |
+          pip install requests feedparser
+
       - name: Run Lenta bot
         run: python src/main.py
-      
+
       - name: Commit database
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add data/sent_links.db || true
-          git commit -m "Update sent news DB [skip ci]" || true
+          git add data/ || true
+          git commit -m "Update sent links database" || true
           git push || true
