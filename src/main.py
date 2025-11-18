@@ -49,36 +49,35 @@ def mark_sent(url, title, summary):
     conn.commit()
     conn.close()
 
-# ---------- ВРЕМЯ И ФИЛЬТР ЗА ПОСЛЕДНИЙ ЧАС ----------
-
 def parse_rss_time(time_str):
     """
-    pubDate в RSS: 'Tue, 18 Nov 2025 19:18:00 +0300'
-    Переводим в datetime в МСК (без tzinfo), чтобы сравнивать с now (тоже МСК).
+    Парсит RFC 2822 время из RSS.
+    Возвращает naive datetime в ЛОКАЛЬНОМ времени сервера.
     """
     try:
-        dt = parsedate_to_datetime(time_str)  # aware datetime
-        # GitHub runner в UTC, но Lenta даёт +0300 (MSK),
-        # нам удобно работать в МСК без tzinfo:
-        dt = dt.astimezone().astimezone()  # просто убедимся, что aware
-        # Оставляем локальное время, но без tzinfo (как "на стене часов"):
-        dt = dt.replace(tzinfo=None)
-        return dt
+        dt = parsedate_to_datetime(time_str)
+        # dt — aware datetime с информацией о часовом поясе (например +0300)
+        # Конвертируем в локальное время сервера (то же, что datetime.now())
+        local_dt = dt.astimezone().replace(tzinfo=None)
+        return local_dt
     except Exception:
         return None
 
 def is_within_last_hour(article_time):
     """
-    Проверяем, что новость попадает в интервал [now-1h, now).
-    Работает в "локальном" времени (как видит GitHub + наш dt без tzinfo).
+    Проверяет, находится ли время новости в диапазоне [now-1h, now].
+    Оба времени в одном часовом поясе (локальном).
     """
     if not article_time:
-        # Если время не распарсили — не отбрасываем, лучше отдать на ИИ
         return True
 
     now = datetime.now()
     one_hour_ago = now - timedelta(hours=1)
-    return one_hour_ago <= article_time < now
+
+    # Логируем для дебага
+    safe_log(f"  📅 Проверка: статья {article_time.strftime('%H:%M:%S')} vs диапазон [{one_hour_ago.strftime('%H:%M:%S')}, {now.strftime('%H:%M:%S')}]")
+
+    return one_hour_ago <= article_time <= now
 
 def fetch_lenta_last_hour():
     """
@@ -129,12 +128,9 @@ def fetch_lenta_last_hour():
     safe_log(f"✓ Найдено за последний час: {len(articles)}")
     return articles
 
-# ---------- QWEN: РАНЖИРОВАНИЕ ----------
-
 def rank_articles_with_ai(articles):
     """
     Qwen выбирает топ 3-5 новостей.
-    Если HF_TOKEN нет или что-то падает — возвращаем первые до 5.
     """
     if not articles or not HF_TOKEN:
         return articles[:5]
@@ -144,7 +140,6 @@ def rank_articles_with_ai(articles):
 
     safe_log(f"🤖 ИИ ранжирует {len(articles)} новостей...")
 
-    # Берём максимум первые 20 для промпта
     subset = articles[:20]
     items_text = "\n".join(
         f"{i+1}. [{a['title']}] {a['desc'][:120]}"
@@ -183,7 +178,6 @@ def rank_articles_with_ai(articles):
             data = response.json()
             if isinstance(data, list) and data:
                 text = data[0].get("generated_text", "").strip()
-                # Берём последнюю строку как ответ
                 line = text.split("\n")[-1]
                 nums = []
                 for part in line.replace(" ", "").split(","):
@@ -191,7 +185,7 @@ def rank_articles_with_ai(articles):
                         idx = int(part) - 1
                         if 0 <= idx < len(subset):
                             nums.append(idx)
-                nums = list(dict.fromkeys(nums))  # убираем дубликаты
+                nums = list(dict.fromkeys(nums))
                 if nums:
                     chosen = [subset[i] for i in nums]
                     safe_log(f"✓ ИИ выбрал новости: {[i+1 for i in nums]}")
@@ -200,10 +194,7 @@ def rank_articles_with_ai(articles):
     except Exception as e:
         safe_log(f"⚠️ Ошибка ранжирования: {str(e)[:80]}")
 
-    # Fallback
     return articles[:5]
-
-# ---------- QWEN: ПЕРЕПИСЬ НОВОСТИ ----------
 
 def rewrite_with_hf(title, text):
     """
@@ -240,10 +231,8 @@ def rewrite_with_hf(title, text):
             data = response.json()
             if isinstance(data, list) and data:
                 result = data[0].get("generated_text", "").strip()
-                # Отрезаем промпт, если модель его повторила
                 if prompt in result:
                     result = result.split(prompt)[-1].strip()
-                # Берём 2–3 предложения
                 sentences = [s.strip() for s in result.split(".") if s.strip()]
                 result = ". ".join(sentences[:3]) + "."
                 result = re.sub(r'\d+$', '', result).strip()
@@ -253,8 +242,6 @@ def rewrite_with_hf(title, text):
         safe_log(f"⚠️ HF ошибка: {str(e)[:80]}")
 
     return text[:180]
-
-# ---------- КАРТИНКА ----------
 
 def download_image(url):
     if not url:
@@ -270,8 +257,6 @@ def download_image(url):
     except:
         pass
     return None
-
-# ---------- ОТПРАВКА В TELEGRAM ----------
 
 def send_to_telegram(articles):
     if not articles:
@@ -323,8 +308,6 @@ def send_to_telegram(articles):
             sent += 1
 
             if i < len(articles):
-                # Для GitHub Actions можно оставить 10–30 секунд,
-                # на VPS можно сделать 300–600 (5–10 минут)
                 time.sleep(10)
 
         except Exception as e:
@@ -332,14 +315,12 @@ def send_to_telegram(articles):
 
     return sent
 
-# ---------- MAIN ----------
-
 def main():
-    safe_log("🚀 LENTA → TELEGRAM (QWEN, LAST HOUR)")
+    safe_log("🚀 LENTA → TELEGRAM (FIXED TIME)")
     safe_log("⏰ Анализ новостей за последний час...\n")
 
     if not all([HF_TOKEN, TG_TOKEN, TG_CHAT_ID]):
-        safe_log("❌ НЕТ СЕКРЕТОВ HF_API_TOKEN / TG_TOKEN / TG_CHAT_ID")
+        safe_log("❌ НЕТ СЕКРЕТОВ")
         return
 
     init_db()
