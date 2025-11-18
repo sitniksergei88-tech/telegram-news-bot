@@ -49,56 +49,19 @@ def mark_sent(url, title, summary):
     conn.commit()
     conn.close()
 
-def parse_rss_time(time_str):
+def fetch_lenta_news():
     """
-    Парсит RFC 2822 время из RSS.
-    Возвращает naive datetime в ЛОКАЛЬНОМ времени сервера.
+    Загружает ВСЕ новости из RSS за последние часы (без строгого фильтра по часам).
+    Берёт свежие новости, которые ещё не отправляли.
     """
-    try:
-        dt = parsedate_to_datetime(time_str)
-        # dt — aware datetime с информацией о часовом поясе (например +0300)
-        # Конвертируем в локальное время сервера (то же, что datetime.now())
-        local_dt = dt.astimezone().replace(tzinfo=None)
-        return local_dt
-    except Exception:
-        return None
-
-def is_within_last_hour(article_time):
-    """
-    Проверяет, находится ли время новости в диапазоне [now-1h, now].
-    Оба времени в одном часовом поясе (локальном).
-    """
-    if not article_time:
-        return True
-
-    now = datetime.now()
-    one_hour_ago = now - timedelta(hours=1)
-
-    # Логируем для дебага
-    safe_log(f"  📅 Проверка: статья {article_time.strftime('%H:%M:%S')} vs диапазон [{one_hour_ago.strftime('%H:%M:%S')}, {now.strftime('%H:%M:%S')}]")
-
-    return one_hour_ago <= article_time <= now
-
-def fetch_lenta_last_hour():
-    """
-    Загружает новости из RSS и оставляет только те,
-    что опубликованы за последний час.
-    """
-    safe_log("📰 Загрузка новостей за последний час...")
+    safe_log("📰 Загрузка новостей из Lenta...")
     feed = feedparser.parse(RSS_URL)
     articles = []
 
-    for entry in feed.entries[:100]:
+    for entry in feed.entries[:100]:  # Берём до 100 последних записей
         title = (entry.get("title") or "").strip()
         link = (entry.get("link") or "").strip()
         desc = (entry.get("summary") or "")[:400].strip()
-
-        # Время публикации
-        published = entry.get("published") or entry.get("pubDate") or ""
-        article_time = parse_rss_time(published)
-
-        if not is_within_last_hour(article_time):
-            continue
 
         # Чистим от цифр в конце
         title = re.sub(r'\d+$', '', title).strip()
@@ -114,6 +77,7 @@ def fetch_lenta_last_hour():
         if not title or not link or len(desc) < 30:
             continue
 
+        # Пропускаем уже отправленные
         if was_sent(link):
             continue
 
@@ -121,43 +85,49 @@ def fetch_lenta_last_hour():
             "title": title,
             "desc": desc,
             "url": link,
-            "image": image_url,
-            "time": article_time
+            "image": image_url
         })
 
-    safe_log(f"✓ Найдено за последний час: {len(articles)}")
+    safe_log(f"✓ Загружено свежих новостей: {len(articles)}")
     return articles
 
-def rank_articles_with_ai(articles):
+def rank_articles_with_qwen(articles):
     """
-    Qwen выбирает топ 3-5 новостей.
+    Qwen выбирает ТОП 3-5 новостей по важности.
+    Это ГЛАВНАЯ функция ранжирования!
     """
     if not articles or not HF_TOKEN:
+        safe_log("⚠️ Нет новостей или HF_TOKEN, беру первые 5")
         return articles[:5]
 
     if len(articles) <= 5:
+        safe_log(f"📊 Всего {len(articles)} новостей, все подходят")
         return articles
 
-    safe_log(f"🤖 ИИ ранжирует {len(articles)} новостей...")
+    safe_log(f"🤖 Qwen ранжирует {len(articles)} новостей, выбирает ТОП 3-5...")
 
-    subset = articles[:20]
+    # Формируем список для Qwen
     items_text = "\n".join(
-        f"{i+1}. [{a['title']}] {a['desc'][:120]}"
-        for i, a in enumerate(subset)
+        f"{i+1}. [{a['title']}] {a['desc'][:150]}"
+        for i, a in enumerate(articles[:50])  # Максимум 50 для промпта
     )
 
-    prompt = f"""Ты опытный редактор новостного Telegram-канала.
-Из списка ниже выбери 3-5 САМЫХ ВАЖНЫХ новостей.
+    prompt = f"""Ты главный редактор Telegram-канала с серьёзными новостями.
+Выбери 3-5 САМЫХ ВАЖНЫХ новостей из этого списка.
 
-Критерии важности:
-- Влияние на большое количество людей
-- Политика, экономика, войны, ЧП, громкие расследования
-- Высокий интерес аудитории
+КРИТЕРИИ ВАЖНОСТИ (в порядке приоритета):
+1. ПОЛИТИКА И ВЛАСТЬ (указы, выборы, смены правительства, санкции)
+2. ВОЙНЫ, КОНФЛИКТЫ, ЧП (боевые действия, теракты, катастрофы)
+3. ЭКОНОМИКА (крахи банков, девальвация, санкции, инфляция)
+4. ГРОМКИЕ РАССЛЕДОВАНИЯ И СКАНДАЛЫ
+5. События с массовым влиянием на жизнь людей
+
+ВЫБЕРИ самые важные - то, что читатели обязательно должны знать сегодня!
 
 Список новостей:
 {items_text}
 
-Ответь ТОЛЬКО НОМЕРАМИ через запятую (например: 1,3,5,7)."""
+Ответь ТОЛЬКО НОМЕРАМИ через запятую, без объяснений! (например: 2,5,8,12)"""
 
     try:
         response = requests.post(
@@ -166,50 +136,64 @@ def rank_articles_with_ai(articles):
             json={
                 "inputs": prompt,
                 "parameters": {
-                    "max_new_tokens": 50,
-                    "temperature": 0.3,
+                    "max_new_tokens": 30,
+                    "temperature": 0.2,  # Пониже температура - более консервативные выборы
                     "do_sample": False
                 }
             },
-            timeout=25
+            timeout=30
         )
 
         if response.status_code == 200:
             data = response.json()
             if isinstance(data, list) and data:
                 text = data[0].get("generated_text", "").strip()
-                line = text.split("\n")[-1]
+                # Берём последнюю строку как ответ
+                lines = text.split("\n")
+                answer_line = lines[-1] if lines else ""
+                
+                safe_log(f"🤖 Qwen ответил: {answer_line}")
+                
+                # Парсим номера
                 nums = []
-                for part in line.replace(" ", "").split(","):
+                for part in answer_line.replace(" ", "").split(","):
                     if part.isdigit():
                         idx = int(part) - 1
-                        if 0 <= idx < len(subset):
+                        if 0 <= idx < len(articles):
                             nums.append(idx)
+                
+                # Убираем дубликаты и сохраняем порядок
                 nums = list(dict.fromkeys(nums))
-                if nums:
-                    chosen = [subset[i] for i in nums]
-                    safe_log(f"✓ ИИ выбрал новости: {[i+1 for i in nums]}")
+                
+                if nums and len(nums) >= 1:
+                    chosen = [articles[i] for i in nums]
+                    safe_log(f"✓ Выбрано новостей: {len(chosen)} (номера: {[i+1 for i in nums]})")
                     return chosen
+                else:
+                    safe_log("⚠️ Qwen не вернул валидные номера, беру первые 5")
+                    return articles[:5]
 
     except Exception as e:
-        safe_log(f"⚠️ Ошибка ранжирования: {str(e)[:80]}")
+        safe_log(f"⚠️ Ошибка Qwen ранжирования: {str(e)[:80]}")
 
+    # Fallback - если что-то пошло не так
+    safe_log("📊 Fallback: беру первые 5 новостей")
     return articles[:5]
 
-def rewrite_with_hf(title, text):
+def rewrite_with_qwen(title, text):
     """
-    Qwen переписывает новость в 2–3 предложения.
+    Qwen переписывает новость в 2–3 предложения живым языком.
     """
     if not HF_TOKEN:
         return text[:180]
 
-    prompt = f"""Перепиши новостной текст на русском языке в 2–3 коротких предложения.
-Сделай формулировку живой и понятной, НЕ копируй исходный текст дословно.
+    prompt = f"""Перепиши эту новость в 2–3 коротких живых предложения на русском.
+ВАЖНО: Не копируй исходный текст! Переделай своими словами, добавь контекст.
 
 Заголовок: {title}
 Текст: {text}
 
-Ответ: только переписанный текст, без пояснений и без лишних комментариев."""
+Переписанный текст (только он, без объяснений):"""
 
     try:
         response = requests.post(
@@ -218,9 +202,9 @@ def rewrite_with_hf(title, text):
             json={
                 "inputs": prompt,
                 "parameters": {
-                    "max_new_tokens": 120,
-                    "temperature": 0.7,
-                    "top_p": 0.9,
+                    "max_new_tokens": 100,
+                    "temperature": 0.8,
+                    "top_p": 0.95,
                     "do_sample": True
                 }
             },
@@ -233,13 +217,16 @@ def rewrite_with_hf(title, text):
                 result = data[0].get("generated_text", "").strip()
                 if prompt in result:
                     result = result.split(prompt)[-1].strip()
+                
+                # Берём 2-3 предложения
                 sentences = [s.strip() for s in result.split(".") if s.strip()]
                 result = ". ".join(sentences[:3]) + "."
                 result = re.sub(r'\d+$', '', result).strip()
+                
                 if len(result) > 30:
                     return result[:400]
     except Exception as e:
-        safe_log(f"⚠️ HF ошибка: {str(e)[:80]}")
+        safe_log(f"⚠️ Ошибка переписи: {str(e)[:60]}")
 
     return text[:180]
 
@@ -259,16 +246,19 @@ def download_image(url):
     return None
 
 def send_to_telegram(articles):
+    """
+    Публикует новости в Telegram с интервалами.
+    """
     if not articles:
         safe_log("⚠️ НЕТ НОВОСТЕЙ ДЛЯ ПУБЛИКАЦИИ")
         return 0
 
-    safe_log(f"📤 Публикую {len(articles)} новостей...\n")
+    safe_log(f"📤 Отправляю {len(articles)} новостей в Telegram...\n")
     sent = 0
 
     for i, art in enumerate(articles, 1):
         title = art["title"]
-        summary = rewrite_with_hf(title, art["desc"])
+        summary = rewrite_with_qwen(title, art["desc"])
 
         msg = f"*{title}*\n\n{summary}"
         image_path = download_image(art.get("image"))
@@ -282,7 +272,7 @@ def send_to_telegram(articles):
                         "caption": msg,
                         "parse_mode": "Markdown"
                     }
-                    requests.post(
+                    r = requests.post(
                         f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
                         files=files,
                         data=data,
@@ -293,7 +283,7 @@ def send_to_telegram(articles):
                 except:
                     pass
             else:
-                requests.post(
+                r = requests.post(
                     f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                     json={
                         "chat_id": TG_CHAT_ID,
@@ -303,36 +293,52 @@ def send_to_telegram(articles):
                     timeout=15
                 )
 
-            safe_log(f"✓ [{i}] {title[:50]}...")
-            mark_sent(art["url"], art["title"], summary)
-            sent += 1
+            if r.status_code == 200:
+                safe_log(f"✓ [{i}] Отправлено: {title[:50]}...")
+                mark_sent(art["url"], art["title"], summary)
+                sent += 1
+            else:
+                safe_log(f"✗ [{i}] Ошибка отправки (код {r.status_code})")
 
+            # Интервал между постами (5-10 сек для тестов, можно увеличить)
             if i < len(articles):
-                time.sleep(10)
+                time.sleep(8)
 
         except Exception as e:
-            safe_log(f"✗ [{i}] Ошибка отправки: {str(e)[:80]}")
+            safe_log(f"✗ [{i}] Ошибка: {str(e)[:80]}")
 
     return sent
 
 def main():
-    safe_log("🚀 LENTA → TELEGRAM (FIXED TIME)")
-    safe_log("⏰ Анализ новостей за последний час...\n")
+    safe_log("🚀 LENTA → TELEGRAM (QWEN RANKING)")
+    safe_log("=" * 60)
 
     if not all([HF_TOKEN, TG_TOKEN, TG_CHAT_ID]):
-        safe_log("❌ НЕТ СЕКРЕТОВ")
+        safe_log("❌ ОШИБКА: Отсутствуют переменные окружения!")
+        safe_log("   Установите: HF_API_TOKEN, TG_TOKEN, TG_CHAT_ID")
         return
 
     init_db()
-    articles = fetch_lenta_last_hour()
-
+    
+    # Загружаем свежие новости
+    articles = fetch_lenta_news()
+    
     if not articles:
-        safe_log("ℹ️ НЕТ НОВОСТЕЙ ЗА ПОСЛЕДНИЙ ЧАС")
+        safe_log("ℹ️ НЕТ НОВЫХ НОВОСТЕЙ")
         return
 
-    top_articles = rank_articles_with_ai(articles)
+    # Qwen выбирает ТОП новости
+    top_articles = rank_articles_with_qwen(articles)
+    
+    if not top_articles:
+        safe_log("ℹ️ Qwen не выбрал ни одну новость")
+        return
+    
+    # Публикуем
     sent = send_to_telegram(top_articles)
-    safe_log(f"\n✨ ГОТОВО! Опубликовано: {sent}/{len(top_articles)}")
+    
+    safe_log("=" * 60)
+    safe_log(f"✨ ЗАВЕРШЕНО! Опубликовано: {sent}/{len(top_articles)} новостей")
 
 if __name__ == "__main__":
     main()
